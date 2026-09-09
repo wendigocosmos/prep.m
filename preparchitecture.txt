@@ -1,0 +1,561 @@
+% Appendix A.  Nested functions and Main function used for preparing HSAFM DNA images for analysis
+
+function [I_nm] = pix2nm(I,framefile,P)
+
+% convert pixel values into nm
+I_title(:) = str2double(regexp(framefile,'[+-]?\d+[\.]?\d*','match'));
+I_single = single(I);           	 
+I_nm = (I_single*(I_title(3)-I_title(2))/2^16)+I_title(2);
+
+function [P] = P_int
+
+P = [];
+P.tcutoff = 0.175;  % pixel height threshold
+P.areacutoff = 300;
+P.areacutoffmin = 300;  % area cutoff for objects in images 1000 x 1000
+P.areacutoffmax = 500000;  % area cutoff for objects in images 250 x 250
+P.cutLow = -0.1; 	% lowest cutoff to pixels outside desired range
+P.cutHigh = 0.55;	% highest cutoff to pixels outside desired range
+
+    function [subIM,IT,I_squarenorm] = masterDNA(P,outpath,path,framefile)
+
+subIM = [];
+I_squarenorm = [];
+
+%% Image acquisition and conversion
+
+% access the image from the folder and establish a path
+I = imread([path,framefile]);
+
+% convert the pixel values into nanometers
+[I_nm] = pix2nm(I,framefile,P);
+
+%% Thresholding
+
+% threshold
+IT = I_nm > P.tcutoff;
+
+%% Object detection
+
+% clear all objects touching the border
+I_clear = imclearborder(IT,8);
+
+% fill in the gaps in the objects
+SE = strel('disk',2,8);
+I_close = imclose(I_clear,SE);
+
+% create a new matrix with original pixel values for only objects above
+% threshold
+I_obj = I_nm;
+IT_not = ~I_close;   % inverse of IT
+I_obj(IT_not) = 0;   % make all pixels that aren't part of objects = 0
+
+% isolate the remaining objects left in the image
+cc = bwconncomp(I_close,8);
+
+%% Quality filter objects
+
+particleAreaS = regionprops(I_close,'Area');
+particleArea = [particleAreaS.Area];
+
+if isempty(particleArea)
+	return
+end
+
+% filter out particles above and below the thresholds
+for k = 1:length(particleArea)
+	boolParticleKeep = particleArea > P.areacutoffmin;
+	boolParticleKeepmax = particleArea > P.areacutoffmax;
+	boolParticleKeep(boolParticleKeepmax) = 0;
+end
+
+pxIdx = cc.PixelIdxList;
+pxIdxFilt = pxIdx(boolParticleKeep);
+
+if isempty(pxIdxFilt)
+	return
+end
+
+[threshIM] = thresh(pxIdxFilt,I_obj);
+
+% send filter images into a folder and converting to original
+boolLow = threshIM < P.cutLow; % pixels that are lower than cutLow
+threshIM(boolLow) = P.cutLow;  % assign pixels < cutLow to cutLow
+boolHigh = threshIM > P.cutHigh; % pixels that are greater than cutHigh
+threshIM(boolHigh) = P.cutHigh;  % assign pixels > cutHigh to cutHigh
+   
+I_norm = (threshIM .* (2^16/(P.cutHigh - P.cutLow))) - (P.cutLow*2^16);
+I_uint = uint16(I_norm);
+
+dest = sprintf('%s_%s.tiff',...
+outpath2,framefile);
+imwrite(I_uint,dest)
+ 
+end
+ 
+
+% Appendix B. Deep CNN used for identification of handwritten numbers and DNA  molecules
+
+% load digit sample data as an image datastore
+digitDatasetPath=fullfile(matlabroot,'toolbox','nnet','nndemos','nndatasets',...
+'DigitDataset');
+imds=imageDatastore(digitDatasetPath,'IncludeSubfolders',true,'LabelSource',...
+'foldernames');
+
+% display some of the images from datastore
+figure;
+perm = randperm(10000,20);
+for i = 1:20
+	subplot(4,5,i);
+	imshow(imds.Files{perm(i)});
+end
+
+% in order to specify the size of the images in the input layer, check the
+% size of the first image
+img = readimage(imds,1);
+size(img)
+
+% divide the data into training and testing sets where each category
+% contains 750 images
+numTrainFiles = 750;
+[imdsTrain,imdsTest] = splitEachLabel(imds,numTrainFiles,'randomize');
+
+% define cnn architecture
+layers = [imageInputLayer([28 28 1])    
+% using image size from line 21 and color channel for grayscale
+ 
+    
+	% filter size 3x3 with 8 neurons(filters) where spatial output size is
+	% the same as the input size
+	convolution2dLayer(3,8,'Padding','same')
+
+	% normalize the activations and gradients to speed up network training
+	% and reduce sensitivity to network initialization
+	batchNormalizationLayer
+
+	% nonlinear activation function (rectified linear unit)
+	reluLayer
+    
+	% down sampling operation to reduce spatial size of the feature map and
+	% remove redundant spatial information. this layer will return the max
+	% values of rectangular regions of inputs, specified by the first
+	% argument followed by the 'Stride' name-value pair to specify the step
+	% size
+	maxPooling2dLayer(2,'Stride',2)
+    
+	% increase in neurons
+	convolution2dLayer(3,128,'Padding','same')
+	batchNormalizationLayer
+	reluLayer
+    
+	maxPooling2dLayer(2,'Stride',2)
+    
+	% decrease in neurons
+	convolution2dLayer(3,64,'Padding','same')
+	batchNormalizationLayer
+	reluLayer
+    
+	maxPooling2dLayer(2,'Stride',2)
+    
+	convolution2dLayer(3,32,'Padding','same')
+	batchNormalizationLayer
+	reluLayer
+    
+	maxPooling2dLayer(2,'Stride',2)
+    
+	convolution2dLayer(3,16,'Padding','same')
+	batchNormalizationLayer
+	reluLayer
+    
+
+    
+	% this layer is where the neurons connect to all the neurons in the
+	% proceeding layer. combines all the features learned by the
+	% previous layers to identify larger patterns. combines features to
+	% classify the images therefore the OutputSize is equal to the number
+	% of classes
+	fullyConnectedLayer(10)
+
+	% normalize the output of the fully connected layer
+	softmaxLayer
+
+	%  this layer uses the probabilities returned by the softmax function
+	%  for each input to assign the input to one of the mutually exclusive
+	%  classes and compute the loss
+	classificationLayer];
+
+% specify training options
+% use sgdm with InitialLearnRate 0.01, set max number of epochs to 4,
+% shuffle the data every epoch, monitor network accuracy during training
+% by specifying validation data and frequency. validation data is
+% not used to update the network weights. turn on the training progress
+% plot, and turn off the command window output
+options = trainingOptions('sgdm','InitialLearnRate',0.01,'MaxEpochs',4,...
+	'Shuffle','every-epoch','ValidationData',imdsTest,'ValidationFrequency',...
+	30,'Verbose',false,'Plots','training-progress');
+
+% train the network
+net = trainNetwork(imdsTrain,layers,options);
+
+% classify images and compute accuracy
+YPred = classify(net,imdsTest);
+YValidation = imdsTest.Labels;
+
+accuracy = sum(YPred == YValidation)/numel(YValidation)
+figure;
+confusionchart(YValidation,YPred)
+
+
+
+% Appendix C. Function used for splitting the original images into subimages
+
+function [SM] = splitMats(I,pxdim)
+
+
+%% OPTION 1
+
+% colDist = size(I,2) / 8 * ones(1,8);
+% create rows that have height of 125
+% rowDist = size(I,1)/ 8 * ones(8,1);
+% create cells for each of the 125 x 125 subimages created
+% SM = mat2cell(I,rowDist,colDist);
+
+%% OPTION 2
+
+[ht,wd] = size(I);
+NrowBlocks = floor(ht/pxdim);
+NcolBlocks = floor(wd/pxdim);
+SM = cell(NrowBlocks,NcolBlocks);
+for ri = 1:NrowBlocks
+    
+	r1 = ri*pxdim-(pxdim-1);
+	rend = ri*pxdim;
+    
+	for ci = 1:NcolBlocks
+  	 
+    	c1 = ci*pxdim-(pxdim-1);
+    	cend = ci*pxdim;
+    	SM{ri,ci} = I(r1:rend,c1:cend);
+
+	end
+end
+
+
+% Appendix D. Function for the GUI used to label subimages
+
+function [lab,fileLabel] = imageLabels(SM,framefile,pxdim,well)
+
+outpath  = ('C:\Users\wendi\Documents\MATLAB\New_data_DNA_images_210625');
+lab = cell(length(SM),1);
+fileLabel = cell(length(SM),1);
+pixthresh = 0.157;
+i = cell(length(SM),1);
+jj = cell(length(SM),1);
+
+% capture numerical values from string array
+V(:) = str2double(regexp(framefile,'[+-]?\d+[\.]?\d*','match'));
+ 
+for SMi = 1:length(SM)
+        
+	% convert uint16 to single precision
+	i{SMi} = single(SM{SMi}); 
+            	 
+	% rescale image to the designated min and max pixel heights
+	jj{SMi} = (i{SMi}*(V(3)-V(2))/2^16)+V(2);    
+
+	% min and max z direction pixels included in data
+	minjj = min(jj{SMi}(:)); 	 
+	maxjj = max(jj{SMi}(:));
+           	 
+	% remove all elements that are beneath the threshold
+	bwjj = jj{SMi} > pixthresh;
+	 
+	% find percentage of true values
+	pctg_1 = nnz(bwjj)./numel(bwjj) * 100;
+    
+   	if pctg_1 < 1
+        	lab = 4;
+
+        	% creating filenames including original image info, location
+        	% index from original images, pixel dimensions and label      	 
+        	fileLabel{SMi} = sprintf('%d_%s_%d_%d_%s',well,framefile,...
+  SMi,pxdim,'Empty_nonDNA');
+        	dest = fullfile(outpath, [fileLabel{SMi} '.tiff']);
+        	imwrite(SM{SMi},dest)
+
+            	 
+   	elseif pctg_1 > 1
+        	imagesc(jj{SMi}) % imagesc to view
+        	axis image
+        	cmap = copper(256);
+        	colormap(cmap);  % Apply colormap
+        	colorbar;  
+        	ax = gca;
+        	ax.CLim = [-0.03 0.55];
+
+
+        	% labels are listed as elongated, 'a', branched 'd',...
+  empty 's',undefined, 'w'
+        	pickLabel = input('Label? Choose: a,d,s,w', 's');
+
+            	switch pickLabel
+                	case 'a'
+                    	lab = 1;
+                    	fileLabel{SMi} = sprintf('%d_%s_%d_%d_%s',...
+  well,framefile,SMi,pxdim,'Elongated');
+                    	dest =fullfile(outpath,[fileLabel{SMi} '.tiff']);
+                    	imwrite(SM{SMi},dest)
+
+                	case 'd'
+                    	lab = 2;
+                    	fileLabel{SMi} = sprintf('%d_%s_%d_%d_%s',...
+  well,framefile,SMi,pxdim,'Branched');
+                    	dest =fullfile(outpath,[fileLabel{SMi} '.tiff']);
+                    	imwrite(SM{SMi},dest)
+                   	 
+                	case 's'
+                    	lab = 4;
+                    	fileLabel{SMi} = sprintf('%d_%s_%d_%d_%s',...
+ well,framefile,SMi,pxdim,'Empty_nonDNA');
+                    	dest =fullfile(outpath,[fileLabel{SMi} '.tiff']);
+                    	imwrite(SM{SMi},dest)
+
+                	case {'w',''}  % a user input of either 'w' or <enter> (i.e. no other keystroke)
+                    	lab = 3;
+                    	fileLabel{SMi} = sprintf('%d_%s_%d_%d_%s',...
+  well,framefile,SMi,pxdim,'Undefined');
+                    	dest =fullfile(outpath,[fileLabel{SMi} '.tiff']);
+                    	imwrite(SM{SMi},dest)
+                   	 
+
+                	otherwise   	% any other entry
+                    	lab = nan;
+                    	return
+
+            	end
+   	end   
+end
+end
+
+% Appendix E. Function used to embed DNA object images into a new zeroed out subimage
+
+function [subIM,I_squarenorm] = subImage(pxIdxFilt,I_obj,path,framefile,outpath,P)
+
+% Break my parent image into subimages and export
+Nparticle = numel(pxIdxFilt);
+subIM = cell(Nparticle,1);
+
+for subInum = 1:Nparticle
+	 
+	% isolate the area around the object to create a subimage
+	[r1,c1] = ind2sub(size(I_obj),pxIdxFilt{subInum});
+	
+	% assign minimum and maximum values for the object
+	rmin = min(r1);
+	rmax = max(r1);
+	cmin = min(c1);
+	cmax = max(c1);
+
+	% define the max dimension in order to pad the image to a square
+	objht = rmax - rmin + 1;
+	objwd = cmax - cmin + 1;
+	maxdim = max(objht,objwd);
+    
+	% create a matrix of zeros for local image
+	subI = false(objht,objwd);
+    
+	% creating indices in the local environment
+	r1local = r1 - rmin + 1;
+	c1local = c1 - cmin + 1;
+	partIdxlocal = sub2ind(size(subI),r1local,c1local);
+	subI(partIdxlocal) = true;
+    
+	padsize = [maxdim - objht,maxdim - objwd];
+    
+	pad_sub = I_obj(rmin:rmax,cmin:cmax);
+	% use mask created with subI to zero out everything but single object
+	pad_sub(~subI) = 0;
+    
+       I_cutoff = pad_sub;
+   
+      % Apply cutoffs to pixels outside desired range
+      boolLow = pad_sub<P.cutLow;   % pixels that are lower than cutLow
+      I_cutoff(boolLow) = P.cutLow;  % assign pixels lower than cutLow to be cutLow
+      boolHigh = pad_sub>P.cutHigh;   % pixels that are lower than cutLow
+      I_cutoff(boolHigh) = P.cutHigh;  % assign pixels lower than cutLow to be cutLow
+   
+      % Uniform rescale to convert to 16-bit
+      I_squarenorm = (I_cutoff .* (2^16/(P.cutHigh - P.cutLow))) - (P.cutLow*2^16);
+
+      I_squarenorm(~subI) = 0;
+    
+% creating a padded array
+		I_square = padarray(I_squarenorm,padsize,'post');
+   
+	% convert to uint16
+ 	I_uint = uint16(I_square);
+
+ 	% resize images to 64 x 64
+ 	subIfinal = imresize(I_uint,[64 64]);
+  	subIM{subInum} = subIfinal;
+
+ 	% Get run name from path
+  	pathSplit = strsplit(path,'\');
+  	runName = pathSplit{end-1};  % last element is empty because of \ at end of path
+
+ 	% Delete range from frame file name
+  	framefileSplit = strsplit(framefile,' ');   	 
+  	frameID = framefileSplit{2};
+
+  	dest = sprintf('%s%s_frame_%s_subIM_%d.tiff',...
+      	outpath,runName,frameID,subInum);
+  	imwrite(subIM{subInum},dest)
+       	 
+end
+% Appendix F. Deep CNN used to train DNA subimages
+
+imds = imageDatastore('C:\Users\local_jcreed\Desktop\Wendy\DNA_Labelimages');
+goundtruth = readtable("DNA_imagelabels.csv",'Delimiter', ',', 'HeaderLines',    0,...
+'ReadVariableNames', true);
+imds.Labels =  categorical(goundtruth.Status);
+% calculate the number of images in each category
+labelCount = countEachLabel(imds)
+
+% divide the data into training and testing sets where each category
+numTrainFiles = 1800;
+
+[imdsTrain,imdsTest] = splitEachLabel(imds,numTrainFiles,'randomize');
+imageAugmenter = imageDataAugmenter('RandRotation',[0 360],'RandXTranslation',[-3 3],...
+'RandYTranslation',[-3 3]);
+augimdsTrain = augmentedImageDatastore([125 125 1],imdsTrain,'DataAugmentation',imageAugmenter);
+Xtrain1 = augimdsTrain.Files(1:1800);
+Xtrain2 = augimdsTrain.Files(1801:3600);
+Xtrain3 = augimdsTrain.Files(3601:5400);
+Xtrain4 = augimdsTrain.Files(5401:7200);
+
+% define cnn architecture
+layers = [imageInputLayer([125 125 1])      
+   convolution2dLayer(3,8,'Padding','same')
+
+   % normalize the activations and gradients to speed up network training
+   % and reduce sensitivity to network initialization
+   batchNormalizationLayer
+
+   % nonlinear activation function (rectified linear unit)
+   reluLayer
+     
+   % down sampling operation to reduce spatial size of the feature map and
+   % remove redundant spatial information. this layer will return the max
+   % values of rectangular regions of inputs, specified by the first
+   % argument followed by the 'Stride' name-value pair to specify the step
+   % size
+   maxPooling2dLayer(2,'Stride',2)
+  
+   convolution2dLayer(3,8,'Padding','same')
+   batchNormalizationLayer
+   reluLayer
+    
+   maxPooling2dLayer(2,'Stride',2)
+  
+   % increase in neurons
+   convolution2dLayer(3,16,'Padding','same')
+   batchNormalizationLayer
+   reluLayer
+  
+   dropoutLayer('Name','drop3');
+  
+   maxPooling2dLayer(2,'Stride',2)
+  
+   convolution2dLayer(3,32,'Padding','same')
+   batchNormalizationLayer
+   reluLayer
+     
+   maxPooling2dLayer(2,'Stride',2) 
+  
+   convolution2dLayer(3,64,'Padding','same')
+   batchNormalizationLayer
+   reluLayer
+  
+   convolution2dLayer(3,128,'Padding','same')
+   batchNormalizationLayer
+   reluLayer 
+   
+   dropoutLayer('Name','drop1');
+  
+   % this layer is where the neurons connect to all the neurons in the
+   % proceeding layer. combines all the features learned by the
+   % previous layers to identify larger patterns. combines features to
+   % classify the images therefore the OutputSize is equal to the number
+   % of classes
+   fullyConnectedLayer(4)
+
+   % normalize the output of the fully connected layer
+   softmaxLayer
+
+   %  this layer uses the probabilities returned by the softmax function
+   %  for each input to assign the input to one of the mutually exclusive
+ %  classes and compute the loss
+ classificationLayer];
+
+ % specify training options
+ % use adam with InitialLearnRate 0.001, set max number of epochs to 30,
+ % shuffle the data every epoch, monitor network accuracy during training
+ % by specifying validation data and frequency. validation data is
+ % not used to update the network weights. turn on the training progress
+ % plot, and turn off the command window output
+ options = trainingOptions('adam','InitialLearnRate',0.001,'MaxEpochs',30,...
+      'Shuffle','every-epoch','MiniBatchSize',64,'ValidationData',augimdsTest,'ValidationFrequency',30,'Verbose',false,'ExecutionEnvironment','gpu','Plots','training-progress');
+
+% train the network
+
+net = trainNetwork(augimdsTrain,layers,options);
+
+% save the trained network
+adam2DNAnet = net
+;
+save adam2DNAnet
+% classify images and compute accuracy
+YPred = classify(net,augimdsTest);
+YValidation = imdsTest.Labels;
+accuracy = sum(YPred == YValidation)/numel(YValidation)
+figure;
+confusionchart(YValidation,YPred)
+
+
+
+% Appendix G. GUI to label subimages as either elongated or branched
+
+function [] = dnaClass(storedpath)
+
+% access the folder containing all of the subimages
+imds = imageDatastore('');
+
+for subIm = 1:length(imds)
+  
+   % select each individual image from the datastore
+   dnaIm = readimage(imds,subIm);
+   imagesc(dnaIm)
+   cmap = copper(256);
+   colormap(cmap);  % Apply colormap
+ 
+   % view image and label either a for elongated of d for branched
+   pickLabel = input('Label? Choose: a,d', 's');
+               switch pickLabel
+                  
+                   case 'a'
+                       fileLabel{subIm} = sprintf('%s_%s',framefile,'Elongated');
+                       dest = fullfile(outpath, [fileLabel{subIm} '.tiff']);
+                       imwrite(dnaIm,dest)
+                   case 'd'
+                       fileLabel{subIm} = sprintf('%s_%s',framefile,'Branched');
+                       dest = fullfile(outpath, [fileLabel{subIm} '.tiff']);
+                       imwrite(dnaIm,dest)                                      
+                                           
+                                       
+                    otherwise       % any other entry
+                       lab = nan;
+                       return
+                      
+               end
+                      
+end
